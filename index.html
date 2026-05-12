@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+  <meta name="theme-color" content="#0b0b18"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="財務管家"/>
+  <title>財務管家</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0b0b18; color: #e8e8f0; font-family: sans-serif; }
+    #root { min-height: 100vh; }
+    #loading { display:flex; align-items:center; justify-content:center; height:100vh; color:#c9a84c; font-size:1.2rem; flex-direction:column; gap:1rem; }
+    .spin { width:36px; height:36px; border:3px solid #c9a84c33; border-top-color:#c9a84c; border-radius:50%; animation:spin .8s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+  </style>
+</head>
+<body>
+<div id="root">
+  <div id="loading">
+    <div class="spin"></div>
+    <div>財務管家載入中…</div>
+  </div>
+</div>
+
+<!-- React + Babel (no build step needed) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+<!-- Firebase -->
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── 常數 ──────────────────────────────────────────────────────────────────────
+const TABS=["💰 總資產","收入","支出","股票","存款","證券","加密幣","⚙️ 設定"];
+const EXP_CATS=["餐飲","交通","娛樂","購物","醫療","居住","教育","其他"];
+const INC_CATS=["本業薪資","兼職收入","獎金","業外收入","股息","租金","其他"];
+const BANKS=["台灣銀行","合作金庫","第一銀行","華南銀行","彰化銀行","國泰世華","富邦銀行","中信銀行","玉山銀行","台新銀行","永豐銀行","聯邦銀行","元大銀行","遠東銀行","渣打銀行","郵局","其他"];
+const CRYPTO_LIST=[
+  {symbol:"BTC",name:"Bitcoin",cgId:"bitcoin"},
+  {symbol:"ETH",name:"Ethereum",cgId:"ethereum"},
+  {symbol:"BNB",name:"BNB",cgId:"binancecoin"},
+  {symbol:"SOL",name:"Solana",cgId:"solana"},
+  {symbol:"USDT",name:"Tether",cgId:"tether"},
+  {symbol:"USDC",name:"USD Coin",cgId:"usd-coin"},
+  {symbol:"XRP",name:"Ripple",cgId:"ripple"},
+  {symbol:"其他",name:"其他幣種",cgId:null},
+];
+const TOKEN_STOCKS=["TSLA","AAPL","NVDA","MSFT","AMZN","GOOGL","META","SPY","QQQ","其他"];
+
+const FEE=0.001425,TAX=0.003;
+const fc=n=>new Intl.NumberFormat("zh-TW",{style:"currency",currency:"TWD",maximumFractionDigits:0}).format(n||0);
+const today=()=>new Date().toISOString().slice(0,10);
+const fDt=s=>{if(!s)return"";const[y,m,d]=s.split("-");return`${y}/${m}/${d}`;};
+const uid=()=>Math.random().toString(36).slice(2,9);
+const cFee=(p,s)=>Math.max(1,Math.round(p*s*FEE));
+const cTax=(p,s)=>Math.round(p*s*TAX);
+const buyT=(p,s)=>p*s+cFee(p,s);
+const sellN=(p,s)=>p*s-cFee(p,s)-cTax(p,s);
+const INIT={expenses:[],incomes:[],stocks:[],stockPrices:{},savings:[],savingTxs:[],securities:[],crypto:[],cryptoPrices:{},usdTwd:31.5};
+
+// ── Firebase ──────────────────────────────────────────────────────────────────
+let _db=null,_unsub=null,_fbActive=false,_fbApp=null;
+function fbConnect(cfg,code,onData,onStatus){
+  try{
+    onStatus("connecting");
+    if(_unsub){_unsub();_unsub=null;}
+    if(_fbApp){try{_fbApp.delete();}catch{}}
+    _fbApp=firebase.initializeApp(cfg,"fm"+(Date.now()%1e7));
+    _db=firebase.firestore(_fbApp);
+    _unsub=_db.doc(`vaults/${code}`).onSnapshot(
+      d=>{if(d.exists)onData(d.data());onStatus("ok");_fbActive=true;},
+      e=>{console.error(e);onStatus("err");}
+    );
+  }catch(e){console.error(e);onStatus("err");}
+}
+function fbSave(code,data){
+  if(!_db||!code)return;
+  _db.doc(`vaults/${code}`).set(data).catch(e=>console.error(e));
+}
+
+// ── LocalStorage ──────────────────────────────────────────────────────────────
+const lGet=k=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null;}catch{return null;}};
+const lSet=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch{}};
+
+// ── 股票計算 ──────────────────────────────────────────────────────────────────
+function calcStocks(stocks){
+  const map={};
+  stocks.forEach(tx=>{if(!map[tx.symbol])map[tx.symbol]=[];map[tx.symbol].push(tx);});
+  const pos={},real={};
+  Object.entries(map).forEach(([sym,txs])=>{
+    const sorted=[...txs].sort((a,b)=>a.date.localeCompare(b.date));
+    let sh=0,tc=0,tr=0;
+    const name=sorted[sorted.length-1].name||sym;
+    sorted.forEach(tx=>{
+      if(tx.action==="買入"){tc+=buyT(tx.price,tx.shares);sh+=tx.shares;}
+      else{const ac=sh>0?tc/sh:0;tr+=sellN(tx.price,tx.shares)-ac*tx.shares;tc-=ac*tx.shares;sh=Math.max(0,sh-tx.shares);if(sh===0)tc=0;}
+    });
+    real[sym]={symbol:sym,name,totalRealized:tr};
+    if(sh>0)pos[sym]={symbol:sym,name,shares:sh,avgCost:sh>0?tc/sh:0};
+  });
+  return{pos,real};
+}
+function calcSellPnL(tx,all){
+  const prev=[...all].filter(t=>t.symbol===tx.symbol&&(t.date<tx.date||(t.date===tx.date&&t.id!==tx.id))).sort((a,b)=>a.date.localeCompare(b.date));
+  let sh=0,tc=0;
+  prev.forEach(t=>{if(t.action==="買入"){tc+=buyT(t.price,t.shares);sh+=t.shares;}else{const ac=sh>0?tc/sh:0;tc-=ac*t.shares;sh=Math.max(0,sh-t.shares);}});
+  return sh>0?sellN(tx.price,tx.shares)-(tc/sh)*tx.shares:null;
+}
+function acctBal(id,txs){return txs.filter(t=>t.accountId===id).reduce((s,t)=>s+(t.type==="提款"?-t.amount:t.amount),0);}
+
+async function lookupStock(sym){
+  try{const q=sym.match(/^\d/)?`${sym}.TW`:sym;const r=await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${q}&lang=zh-TW&region=TW&quotesCount=1&newsCount=0`,{headers:{Accept:"application/json"}});if(!r.ok)return null;const d=await r.json();return d?.quotes?.[0]?.longname||d?.quotes?.[0]?.shortname||null;}catch{return null;}
+}
+async function fetchCryptoPx(ids){
+  try{const r=await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids.join(",")}&vs_currencies=usd`);if(!r.ok)return{};return await r.json();}catch{return{};}
+}
+
+// ── UI ────────────────────────────────────────────────────────────────────────
+const iS={width:"100%",boxSizing:"border-box",background:"#0f0f22",border:"1px solid #2e2e44",borderRadius:10,padding:"0.65rem 0.9rem",color:"#e8e8f0",fontSize:"0.95rem",outline:"none",fontFamily:"inherit"};
+const sS={...iS,cursor:"pointer"};
+
+function Modal({open,onClose,title,children}){
+  if(!open)return null;
+  return React.createElement("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,.82)",zIndex:999,display:"flex",alignItems:"flex-end",justifyContent:"center"},onClick:e=>e.target===e.currentTarget&&onClose()},
+    React.createElement("div",{style:{background:"#16162a",border:"1px solid #c9a84c44",borderRadius:"20px 20px 0 0",padding:"1.2rem 1.4rem 2.5rem",width:"100%",maxWidth:520,boxShadow:"0 -12px 40px #000c",maxHeight:"92vh",overflowY:"auto"}},
+      React.createElement("div",{style:{width:40,height:4,background:"#333",borderRadius:99,margin:"0 auto 1rem"}}),
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"1.2rem"}},
+        React.createElement("span",{style:{fontFamily:"'Noto Serif TC',serif",fontSize:"1.05rem",color:"#c9a84c",fontWeight:700}},title),
+        React.createElement("button",{onClick:onClose,style:{background:"#ffffff11",border:"none",color:"#aaa",cursor:"pointer",borderRadius:99,width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center"}},"✕")
+      ),
+      children
+    )
+  );
+}
+
+function DelConfirm({open,onCancel,onConfirm}){
+  if(!open)return null;
+  return React.createElement("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,.82)",zIndex:1001,display:"flex",alignItems:"center",justifyContent:"center",padding:"1rem"}},
+    React.createElement("div",{style:{background:"#16162a",border:"1px solid #e05a5a55",borderRadius:16,padding:"1.5rem",width:"100%",maxWidth:300,textAlign:"center"}},
+      React.createElement("div",{style:{fontSize:"2rem",marginBottom:"0.5rem"}},"🗑"),
+      React.createElement("div",{style:{fontWeight:700,marginBottom:"0.3rem"}},"確定要刪除嗎？"),
+      React.createElement("div",{style:{fontSize:"0.78rem",color:"#888",marginBottom:"1.2rem"}},"刪除後無法復原"),
+      React.createElement("div",{style:{display:"flex",gap:"0.6rem"}},
+        React.createElement("button",{onClick:onCancel,style:{flex:1,padding:"0.65rem",background:"#ffffff11",border:"1px solid #333",borderRadius:10,color:"#aaa",cursor:"pointer",fontFamily:"inherit"}},"取消"),
+        React.createElement("button",{onClick:onConfirm,style:{flex:1,padding:"0.65rem",background:"linear-gradient(135deg,#e05a5a,#b83c3c)",border:"none",borderRadius:10,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontWeight:700}},"確定刪除")
+      )
+    )
+  );
+}
+
+const Fld=({label,children})=>React.createElement("div",{style:{marginBottom:"0.85rem"}},React.createElement("div",{style:{fontSize:"0.7rem",color:"#888",marginBottom:"0.3rem",letterSpacing:1}},label),children);
+const Sel=({value,onChange,options})=>React.createElement("select",{style:sS,value,onChange:e=>onChange(e.target.value)},options.map(o=>React.createElement("option",{key:o.v||o,value:o.v||o},o.l||o)));
+const Inp=p=>React.createElement("input",{style:iS,...p});
+const Bdg=({children,color="#c9a84c"})=>React.createElement("span",{style:{background:color+"22",color,borderRadius:999,padding:"2px 9px",fontSize:"0.7rem",fontWeight:600,whiteSpace:"nowrap"}},children);
+
+function StatCard({label,value,sub,color="#c9a84c",trend}){
+  return React.createElement("div",{style:{background:"#12122099",border:`1px solid ${color}33`,borderRadius:14,padding:"0.85rem 1rem",flex:1,minWidth:90}},
+    React.createElement("div",{style:{fontSize:"0.6rem",color:"#888",letterSpacing:1,marginBottom:"0.25rem"}},label),
+    React.createElement("div",{style:{fontSize:"1rem",fontWeight:800,color,fontFamily:"'Noto Serif TC',serif",lineHeight:1.2}},value),
+    sub&&React.createElement("div",{style:{fontSize:"0.63rem",color:"#666",marginTop:"0.18rem"}},sub),
+    trend!==undefined&&React.createElement("div",{style:{fontSize:"0.68rem",color:trend>=0?"#4caf8c":"#e05a5a",marginTop:"0.18rem"}},(trend>=0?"▲":"▼")+" "+Math.abs(trend).toFixed(1)+"%")
+  );
+}
+
+function DtFld({label,value,onChange}){
+  return React.createElement("div",{style:{marginBottom:"1rem"}},
+    React.createElement("div",{style:{fontSize:"0.7rem",color:"#888",marginBottom:"0.35rem",letterSpacing:1}},"📅 "+(label||"日期")),
+    React.createElement("input",{type:"date",value,onChange:e=>onChange(e.target.value),style:{...iS,border:"2px solid #c9a84c77",colorScheme:"dark"}}),
+    value&&React.createElement("div",{style:{fontSize:"0.72rem",color:"#c9a84c",marginTop:"0.28rem"}},"✓ "+fDt(value))
+  );
+}
+
+function AddBtn({onClick,children,color}){
+  const bg=color?`linear-gradient(135deg,${color},${color}bb)`:"linear-gradient(135deg,#c9a84c,#a87d30)";
+  return React.createElement("button",{onClick,style:{background:bg,border:"none",borderRadius:10,padding:"0.5rem 0.95rem",color:color?"#fff":"#0b0b18",fontWeight:800,fontSize:"0.82rem",cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap"}},children);
+}
+function SaveBtn({onClick,children,color="#c9a84c",disabled}){
+  const bgs={g:"linear-gradient(135deg,#4caf8c,#2e8b6a)",r:"linear-gradient(135deg,#e05a5a,#b83c3c)",b:"linear-gradient(135deg,#4a9eff,#2563eb)",p:"linear-gradient(135deg,#9b59b6,#7d3c98)",o:"linear-gradient(135deg,#f39c12,#d68910)"};
+  const bg=disabled?"#333":color==="#4caf8c"?bgs.g:color==="#e05a5a"?bgs.r:color==="#4a9eff"?bgs.b:color==="#9b59b6"?bgs.p:color==="#f39c12"?bgs.o:"linear-gradient(135deg,#c9a84c,#a87d30)";
+  return React.createElement("button",{onClick,disabled,style:{display:"block",width:"100%",marginTop:"0.6rem",background:bg,border:"none",borderRadius:12,padding:"0.8rem",color:disabled?"#666":"#fff",fontWeight:800,fontSize:"0.95rem",cursor:disabled?"not-allowed":"pointer",fontFamily:"inherit",letterSpacing:1}},children);
+}
+
+const Section=({title,children})=>React.createElement("div",{style:{marginTop:"1.2rem"}},
+  React.createElement("div",{style:{fontSize:"0.65rem",letterSpacing:2,color:"#666",marginBottom:"0.45rem",borderLeft:"2px solid #c9a84c",paddingLeft:"0.5rem"}},title),
+  children
+);
+const Empty=({text})=>React.createElement("div",{style:{textAlign:"center",padding:"2.2rem 0",color:"#444",fontSize:"0.85rem"}},text);
+const PnLPill=({value,label})=>React.createElement("span",{style:{background:value>=0?"#4caf8c18":"#e05a5a18",border:`1px solid ${value>=0?"#4caf8c44":"#e05a5a44"}`,borderRadius:8,padding:"3px 9px",fontSize:"0.73rem",color:value>=0?"#4caf8c":"#e05a5a",fontWeight:700}},(value>=0?"▲":"▼")+" "+label+"："+(value>=0?"+":"")+fc(value));
+
+function SymInput({symbol,onSymbol,onName}){
+  const [st,setSt]=useState("");const tmr=useRef(null);
+  const lookup=useCallback(async sym=>{
+    if(!sym||sym.length<3){setSt("");return;}setSt("loading");
+    const n=await lookupStock(sym);
+    if(n){onName(n);setSt("found");}else setSt("notfound");
+  },[onName]);
+  return React.createElement(Fld,{label:"股票代號"},
+    React.createElement("div",{style:{position:"relative"}},
+      React.createElement("input",{style:{...iS,paddingRight:"2rem"},type:"text",placeholder:"如 2330、0050、TSLA",value:symbol,
+        onChange:e=>{const v=e.target.value.toUpperCase();onSymbol(v);onName("");if(tmr.current)clearTimeout(tmr.current);tmr.current=setTimeout(()=>lookup(v),700);}}),
+      React.createElement("span",{style:{position:"absolute",right:"0.75rem",top:"50%",transform:"translateY(-50%)",fontSize:"0.85rem"}},
+        st==="loading"?React.createElement("span",{style:{color:"#c9a84c"}},"⟳"):
+        st==="found"?React.createElement("span",{style:{color:"#4caf8c"}},"✓"):
+        st==="notfound"?React.createElement("span",{style:{color:"#e05a5a"}},"?"):null
+      )
+    ),
+    st==="loading"&&React.createElement("div",{style:{fontSize:"0.68rem",color:"#c9a84c",marginTop:"0.25rem"}},"查詢中…"),
+    st==="found"&&React.createElement("div",{style:{fontSize:"0.68rem",color:"#4caf8c",marginTop:"0.25rem"}},"✓ 已自動帶入名稱"),
+    st==="notfound"&&React.createElement("div",{style:{fontSize:"0.68rem",color:"#e05a5a",marginTop:"0.25rem"}},"查無此代號，請手動輸入")
+  );
+}
+
+function FeeBox({action,price,shares,avgCost}){
+  if(!price||!shares||+price<=0||+shares<=0)return null;
+  const p=+price,s=+shares;
+  const fee=cFee(p,s),tax=action==="賣出"?cTax(p,s):0;
+  const pnl=action==="賣出"&&avgCost>0?sellN(p,s)-avgCost*s:null;
+  return React.createElement("div",{style:{background:"#0f0f22",border:"1px solid #2e2e44",borderRadius:10,padding:"0.7rem 1rem",marginBottom:"0.85rem",fontSize:"0.77rem"}},
+    React.createElement("div",{style:{color:"#c9a84c",fontWeight:700,marginBottom:"0.4rem"}},"💰 費用試算"),
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0.18rem 0.5rem",color:"#aaa"}},
+      React.createElement("span",null,"成交金額"),React.createElement("span",{style:{textAlign:"right",color:"#e8e8f0"}},fc(p*s)),
+      React.createElement("span",null,"手續費 0.1425%"),React.createElement("span",{style:{textAlign:"right",color:"#e05a5a"}},"－"+fc(fee)),
+      action==="賣出"&&React.createElement("span",null,"交易稅 0.3%"),
+      action==="賣出"&&React.createElement("span",{style:{textAlign:"right",color:"#e05a5a"}},"－"+fc(tax)),
+      React.createElement("div",{style:{gridColumn:"1/-1",borderTop:"1px solid #2e2e44",margin:"0.18rem 0"}}),
+      React.createElement("span",{style:{fontWeight:700,color:"#e8e8f0"}},action==="買入"?"實際花費":"實際入帳"),
+      React.createElement("span",{style:{textAlign:"right",fontWeight:700,color:"#c9a84c"}},fc(action==="買入"?p*s+fee:p*s-fee-tax)),
+      pnl!==null&&React.createElement("div",{style:{gridColumn:"1/-1",borderTop:"1px solid #2e2e44",margin:"0.18rem 0"}}),
+      pnl!==null&&React.createElement("span",{style:{fontWeight:700}},"預估損益（含費）"),
+      pnl!==null&&React.createElement("span",{style:{textAlign:"right",fontWeight:800,color:pnl>=0?"#4caf8c":"#e05a5a"}},(pnl>=0?"+":"")+fc(pnl))
+    )
+  );
+}
+
+function SavTxModal({open,onClose,account,onSave}){
+  const [type,setType]=useState("存入");
+  const [amount,setAmount]=useState("");
+  const [date,setDate]=useState(today());
+  const [note,setNote]=useState("");
+  const go=()=>{if(!amount||+amount<=0)return;onSave({id:uid(),accountId:account?.id,type,amount:+amount,date,note});setAmount("");setNote("");onClose();};
+  return React.createElement(Modal,{open,onClose,title:(account?.bank||"")+" "+(account?.name||"")+" 調整餘額"},
+    React.createElement("div",{style:{display:"flex",gap:"0.5rem",marginBottom:"0.85rem"}},
+      ["存入","提款"].map(t=>React.createElement("button",{key:t,onClick:()=>setType(t),style:{flex:1,padding:"0.6rem",background:type===t?(t==="存入"?"#4caf8c22":"#e05a5a22"):"#0f0f22",border:`1.5px solid ${type===t?(t==="存入"?"#4caf8c":"#e05a5a"):"#2e2e44"}`,borderRadius:10,color:type===t?(t==="存入"?"#4caf8c":"#e05a5a"):"#888",cursor:"pointer",fontWeight:700,fontFamily:"inherit",fontSize:"0.9rem"}},t==="存入"?"＋ 存入":"－ 提款"))
+    ),
+    React.createElement(DtFld,{value:date,onChange:setDate}),
+    React.createElement(Fld,{label:"金額（元）"},React.createElement(Inp,{type:"number",placeholder:"0",value:amount,onChange:e=>setAmount(e.target.value)})),
+    React.createElement(Fld,{label:"備註（選填）"},React.createElement(Inp,{type:"text",placeholder:"薪資、繳費…",value:note,onChange:e=>setNote(e.target.value)})),
+    React.createElement(SaveBtn,{onClick:go,color:type==="存入"?"#4caf8c":"#e05a5a"},"確認"+type)
+  );
+}
+
+function RRow({r,color,onDel}){
+  const[h,setH]=useState(false);
+  return React.createElement("div",{onMouseEnter:()=>setH(true),onMouseLeave:()=>setH(false),style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"0.65rem 0.4rem",borderBottom:"1px solid #1e1e30",borderRadius:8}},
+    React.createElement("div",{style:{display:"flex",gap:"0.6rem",alignItems:"center"}},
+      React.createElement("div",{style:{textAlign:"center",minWidth:36}},
+        React.createElement("div",{style:{fontSize:"1.05rem",fontWeight:700,color:"#aaa",lineHeight:1}},r.date.slice(8)),
+        React.createElement("div",{style:{fontSize:"0.58rem",color:"#555"}},r.date.slice(0,7).replace("-","/"))
+      ),
+      React.createElement("div",null,
+        React.createElement(Bdg,null,r.category),
+        r.note&&React.createElement("div",{style:{fontSize:"0.68rem",color:"#666",marginTop:2}},r.note)
+      )
+    ),
+    React.createElement("div",{style:{display:"flex",alignItems:"center",gap:"0.5rem"}},
+      React.createElement("div",{style:{fontWeight:700,fontSize:"0.9rem",color}},fc(r.amount)),
+      h&&React.createElement("button",{onClick:onDel,style:{background:"#e05a5a22",border:"1px solid #e05a5a44",borderRadius:6,padding:"2px 7px",color:"#e05a5a",cursor:"pointer",fontSize:"0.7rem"}},"🗑")
+    )
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App(){
+  const [D,_setD]=useState(INIT);
+  const [ready,setReady]=useState(false);
+  const [tab,setTab]=useState(0);
+  const [fbCfgStr,setFbCfgStr]=useState("");
+  const [vCode,setVCode]=useState("");
+  const [sync,setSync]=useState("local");
+  const saveRef=useRef(null);
+
+  const [mExp,setMExp]=useState(false);
+  const [mInc,setMInc]=useState(false);
+  const [mStk,setMStk]=useState(false);
+  const [mSav,setMSav]=useState(false);
+  const [mSavAdj,setMSavAdj]=useState(false);
+  const [mSec,setMSec]=useState(false);
+  const [mSecEdit,setMSecEdit]=useState(null);
+  const [mCry,setMCry]=useState(false);
+  const [mCryEdit,setMCryEdit]=useState(null);
+  const [mPrice,setMPrice]=useState(false);
+  const [del,setDel]=useState(null);
+  const [adjAccount,setAdjAccount]=useState(null);
+  const [priceTarget,setPriceTarget]=useState(null);
+  const [priceInput,setPriceInput]=useState("");
+  const [cryptoLoading,setCryptoLoading]=useState(false);
+
+  const [eF,setEF]=useState({date:today(),category:EXP_CATS[0],amount:"",note:""});
+  const [iF,setIF]=useState({date:today(),category:INC_CATS[0],amount:"",note:""});
+  const [sF,setSF]=useState({date:today(),symbol:"",name:"",action:"買入",shares:"",price:"",note:""});
+  const [savF,setSavF]=useState({bank:BANKS[0],name:"",initBalance:"",note:""});
+  const [secF,setSecF]=useState({symbol:"",name:"",shares:"",cost:"",marketValue:""});
+  const [cryF,setCryF]=useState({symbol:"BTC",name:"Bitcoin",cgId:"bitcoin",isToken:false,tokenSymbol:"TSLA",quantity:"",costTWD:"",manualPrice:""});
+
+  const setD=useCallback((upd)=>{
+    _setD(prev=>{
+      const next=typeof upd==="function"?upd(prev):{...prev,...upd};
+      if(saveRef.current)clearTimeout(saveRef.current);
+      saveRef.current=setTimeout(()=>{
+        if(_fbActive&&vCode){fbSave(vCode,next);}
+        else{Object.keys(INIT).forEach(k=>lSet("_d_"+k,next[k]));}
+      },600);
+      return next;
+    });
+  },[vCode]);
+
+  useEffect(()=>{
+    const loaded={};
+    Object.keys(INIT).forEach(k=>{const v=lGet("_d_"+k);if(v!==null)loaded[k]=v;});
+    _setD(p=>({...p,...loaded}));
+    const cfg=lGet("_fbcfg");const vc=lGet("_vcode");
+    if(cfg&&vc){setFbCfgStr(JSON.stringify(cfg,null,2));setVCode(vc);doConnectFB(cfg,vc);}
+    setReady(true);
+  },[]);
+
+  const doConnectFB=(cfg,code)=>{
+    fbConnect(cfg,code,data=>{_setD(p=>({...INIT,...p,...data}));},s=>{setSync(s);});
+  };
+  const saveFBSettings=()=>{
+    try{const cfg=JSON.parse(fbCfgStr);lSet("_fbcfg",cfg);lSet("_vcode",vCode);doConnectFB(cfg,vCode);}
+    catch{alert("Firebase 設定格式錯誤");}
+  };
+  const disconnectFB=()=>{
+    if(_unsub){_unsub();_unsub=null;}_fbActive=false;_db=null;
+    lSet("_fbcfg",null);lSet("_vcode","");
+    setSync("local");setFbCfgStr("");setVCode("");
+  };
+
+  const thisMonth=new Date().toISOString().slice(0,7);
+  const {pos,real}=calcStocks(D.stocks);
+  const posArr=Object.values(pos);
+  const totalExp=D.expenses.filter(e=>e.date.startsWith(thisMonth)).reduce((s,e)=>s+e.amount,0);
+  const totalInc=D.incomes.filter(i=>i.date.startsWith(thisMonth)).reduce((s,i)=>s+i.amount,0);
+  const totalSav=D.savings.reduce((s,a)=>s+acctBal(a.id,D.savingTxs),0);
+  const stocksMV=posArr.reduce((s,p)=>s+(D.stockPrices[p.symbol]||p.avgCost)*p.shares,0);
+  const stocksCost=posArr.reduce((s,p)=>s+p.avgCost*p.shares,0);
+  const secMV=D.securities.reduce((s,a)=>s+a.marketValue,0);
+  const cryptoTWD=D.crypto.reduce((s,c)=>{const px=D.cryptoPrices[c.cgId||c.symbol]?.usd||c.manualPrice||0;return s+c.quantity*px*D.usdTwd;},0);
+  const cryptoCost=D.crypto.reduce((s,c)=>s+c.costTWD*c.quantity,0);
+  const totalAssets=totalSav+stocksMV+secMV+cryptoTWD;
+  const realPnL=Object.values(real).reduce((s,r)=>s+r.totalRealized,0);
+
+  const openDel=(type,id)=>setDel({type,id});
+  const confirmDel=()=>{
+    if(!del)return;
+    const{type,id}=del;
+    if(type==="exp")setD(p=>({...p,expenses:p.expenses.filter(e=>e.id!==id)}));
+    if(type==="inc")setD(p=>({...p,incomes:p.incomes.filter(e=>e.id!==id)}));
+    if(type==="stk")setD(p=>({...p,stocks:p.stocks.filter(e=>e.id!==id)}));
+    if(type==="sav")setD(p=>({...p,savings:p.savings.filter(e=>e.id!==id),savingTxs:p.savingTxs.filter(t=>t.accountId!==id)}));
+    if(type==="savTx")setD(p=>({...p,savingTxs:p.savingTxs.filter(e=>e.id!==id)}));
+    if(type==="sec")setD(p=>({...p,securities:p.securities.filter(e=>e.id!==id)}));
+    if(type==="cry")setD(p=>({...p,crypto:p.crypto.filter(e=>e.id!==id)}));
+    setDel(null);
+  };
+
+  const addExp=()=>{if(!eF.amount)return;setD(p=>({...p,expenses:[{id:uid(),...eF,amount:+eF.amount},...p.expenses]}));setMExp(false);setEF({date:today(),category:EXP_CATS[0],amount:"",note:""});};
+  const addInc=()=>{if(!iF.amount)return;setD(p=>({...p,incomes:[{id:uid(),...iF,amount:+iF.amount},...p.incomes]}));setMInc(false);setIF({date:today(),category:INC_CATS[0],amount:"",note:""});};
+  const addStk=()=>{if(!sF.symbol||!sF.shares||!sF.price)return;setD(p=>({...p,stocks:[{id:uid(),...sF,shares:+sF.shares,price:+sF.price},...p.stocks]}));setMStk(false);setSF({date:today(),symbol:"",name:"",action:"買入",shares:"",price:"",note:""});};
+  const addSav=()=>{
+    if(!savF.bank)return;
+    const id=uid();
+    const initTx=savF.initBalance&&+savF.initBalance>0?[{id:uid(),accountId:id,type:"初始餘額",amount:+savF.initBalance,date:today(),note:""}]:[];
+    setD(p=>({...p,savings:[{id,bank:savF.bank,name:savF.name,note:savF.note},...p.savings],savingTxs:[...initTx,...p.savingTxs]}));
+    setMSav(false);setSavF({bank:BANKS[0],name:"",initBalance:"",note:""});
+  };
+  const addSavTx=(tx)=>setD(p=>({...p,savingTxs:[tx,...p.savingTxs]}));
+  const addSec=()=>{
+    if(!secF.symbol||!secF.shares||!secF.cost||!secF.marketValue)return;
+    if(mSecEdit){setD(p=>({...p,securities:p.securities.map(s=>s.id===mSecEdit?{...s,...secF,shares:+secF.shares,cost:+secF.cost,marketValue:+secF.marketValue}:s)}));setMSecEdit(null);}
+    else setD(p=>({...p,securities:[{id:uid(),...secF,shares:+secF.shares,cost:+secF.cost,marketValue:+secF.marketValue},...p.securities]}));
+    setMSec(false);setSecF({symbol:"",name:"",shares:"",cost:"",marketValue:""});
+  };
+  const addCry=()=>{
+    const sym=cryF.isToken?cryF.tokenSymbol:cryF.symbol;
+    const cgId=cryF.isToken?null:cryF.cgId;
+    if(!sym||!cryF.quantity)return;
+    const entry={id:uid(),symbol:sym,name:cryF.isToken?sym+" (代幣化美股)":cryF.name,cgId,isToken:cryF.isToken,quantity:+cryF.quantity,costTWD:+cryF.costTWD||0,manualPrice:+cryF.manualPrice||0};
+    if(mCryEdit){setD(p=>({...p,crypto:p.crypto.map(c=>c.id===mCryEdit?{...c,...entry,id:c.id}:c)}));setMCryEdit(null);}
+    else setD(p=>({...p,crypto:[entry,...p.crypto]}));
+    setMCry(false);setCryF({symbol:"BTC",name:"Bitcoin",cgId:"bitcoin",isToken:false,tokenSymbol:"TSLA",quantity:"",costTWD:"",manualPrice:""});
+  };
+  const updateStockPrice=()=>{if(!priceInput||!priceTarget)return;setD(p=>({...p,stockPrices:{...p.stockPrices,[priceTarget]:+priceInput}}));setPriceTarget(null);setPriceInput("");setMPrice(false);};
+  const refreshCryptoPx=async()=>{
+    setCryptoLoading(true);
+    const ids=[...new Set(D.crypto.filter(c=>c.cgId).map(c=>c.cgId))];
+    if(ids.length>0){const data=await fetchCryptoPx(ids);setD(p=>({...p,cryptoPrices:{...p.cryptoPrices,...data}}));}
+    setCryptoLoading(false);
+  };
+
+  const syncLabel={local:"🔴 本地模式",connecting:"🟡 連線中…",ok:"🟢 已同步",err:"🔴 同步失敗"}[sync]||"本地模式";
+
+  return React.createElement("div",{style:{minHeight:"100vh",background:"#0b0b18",fontFamily:"'Noto Sans TC',sans-serif",color:"#e8e8f0",backgroundImage:"radial-gradient(ellipse at 20% 0%,#1a1a3e44 0%,transparent 60%)"}},
+    // Global styles
+    React.createElement("style",null,`
+      @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;600;800&family=Noto+Serif+TC:wght@700&display=swap');
+      *{box-sizing:border-box}
+      ::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-thumb{background:#333;border-radius:4px}
+      input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
+      input[type=date],input[type=month]{color-scheme:dark}
+      .rh:hover{background:#ffffff07!important}
+    `),
+
+    // Header
+    React.createElement("div",{style:{padding:"1.2rem 1.2rem 0",maxWidth:820,margin:"0 auto"}},
+      React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
+        React.createElement("div",null,
+          React.createElement("div",{style:{fontFamily:"'Noto Serif TC',serif",fontSize:"1.45rem",fontWeight:700,color:"#c9a84c",letterSpacing:2}},"財務管家"),
+          React.createElement("div",{style:{fontSize:"0.65rem",color:"#555",letterSpacing:1,marginTop:1}},"PERSONAL FINANCE TRACKER")
+        ),
+        React.createElement("div",{style:{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:"0.35rem"}},
+          React.createElement("div",{style:{fontSize:"0.68rem",color:sync==="ok"?"#4caf8c":sync==="connecting"?"#c9a84c":"#e05a5a",fontWeight:700}},syncLabel),
+          React.createElement("div",{style:{fontSize:"0.72rem",color:totalInc-totalExp>=0?"#4caf8c":"#e05a5a",fontWeight:700}},(totalInc-totalExp>=0?"結餘 +":"赤字 ")+fc(totalInc-totalExp))
+        )
+      ),
+      // Tabs
+      React.createElement("div",{style:{display:"flex",marginTop:"1.1rem",borderBottom:"1px solid #2a2a3e",overflowX:"auto",scrollbarWidth:"none"}},
+        TABS.map((t,i)=>React.createElement("button",{key:t,onClick:()=>setTab(i),style:{background:"none",border:"none",padding:"0.55rem 0.65rem",color:tab===i?"#c9a84c":"#666",cursor:"pointer",borderBottom:tab===i?"2px solid #c9a84c":"2px solid transparent",fontSize:"0.75rem",fontFamily:"inherit",fontWeight:tab===i?700:400,marginBottom:-1,transition:"color .2s",whiteSpace:"nowrap"}},t))
+      )
+    ),
+
+    !ready?React.createElement("div",{style:{textAlign:"center",padding:"4rem",color:"#555"}},"載入中…"):
+    React.createElement("div",{style:{padding:"1rem 1.2rem 5rem",maxWidth:820,margin:"0 auto"}},
+
+      // ── 總資產 ──
+      tab===0&&React.createElement("div",null,
+        React.createElement("div",{style:{background:"linear-gradient(135deg,#14142a,#1e1e3e)",border:"1px solid #c9a84c33",borderRadius:16,padding:"1.2rem 1.4rem",marginBottom:"1rem"}},
+          React.createElement("div",{style:{fontSize:"0.68rem",color:"#888",letterSpacing:2,marginBottom:"0.3rem"}},"總資產（當前估值）"),
+          React.createElement("div",{style:{fontSize:"2rem",fontWeight:800,color:"#c9a84c",fontFamily:"'Noto Serif TC',serif"}},fc(totalAssets)),
+          React.createElement("div",{style:{display:"flex",gap:"0.5rem",marginTop:"0.8rem",flexWrap:"wrap"}},
+            [{l:"現金存款",v:totalSav,c:"#4a9eff"},{l:"股票持倉",v:stocksMV,c:"#c9a84c"},{l:"證券庫存",v:secMV,c:"#9b59b6"},{l:"加密貨幣",v:cryptoTWD,c:"#f39c12"}].map(({l,v,c})=>
+              React.createElement("div",{key:l,style:{flex:1,minWidth:90,background:"#ffffff08",borderRadius:10,padding:"0.55rem 0.75rem",borderLeft:`3px solid ${c}`}},
+                React.createElement("div",{style:{fontSize:"0.6rem",color:"#888"}},l),
+                React.createElement("div",{style:{fontSize:"0.88rem",fontWeight:700,color:c,marginTop:2}},fc(v))
+              )
+            )
+          )
+        ),
+        React.createElement("div",{style:{display:"flex",gap:"0.5rem",marginBottom:"1rem",flexWrap:"wrap"}},
+          React.createElement(StatCard,{label:"本月收入",value:fc(totalInc),color:"#4caf8c"}),
+          React.createElement(StatCard,{label:"本月支出",value:fc(totalExp),color:"#e05a5a"}),
+          React.createElement(StatCard,{label:"本月結餘",value:fc(totalInc-totalExp),color:totalInc-totalExp>=0?"#4caf8c":"#e05a5a"}),
+          React.createElement(StatCard,{label:"股票已實現(含費)",value:fc(realPnL),color:realPnL>=0?"#4caf8c":"#e05a5a"})
+        ),
+        React.createElement(Section,{title:"本月支出分類"},
+          EXP_CATS.map(cat=>{const sum=D.expenses.filter(e=>e.date.startsWith(thisMonth)&&e.category===cat).reduce((s,e)=>s+e.amount,0);if(!sum)return null;const p=totalExp>0?sum/totalExp*100:0;return React.createElement("div",{key:cat,style:{display:"flex",alignItems:"center",gap:"0.6rem",padding:"0.4rem 0",borderBottom:"1px solid #1e1e30"}},React.createElement("div",{style:{width:70,fontSize:"0.78rem",color:"#aaa"}},cat),React.createElement("div",{style:{flex:1,height:5,background:"#1e1e30",borderRadius:99}},React.createElement("div",{style:{width:`${p}%`,height:"100%",background:"#c9a84c",borderRadius:99}})),React.createElement("div",{style:{width:80,textAlign:"right",fontSize:"0.78rem",fontWeight:600}},fc(sum)));}).filter(Boolean),
+          totalExp===0&&React.createElement(Empty,{text:"本月尚無支出"})
+        )
+      ),
+
+      // ── 收入 ──
+      tab===1&&React.createElement("div",null,
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"1rem"}},
+          React.createElement("div",null,React.createElement("div",{style:{fontSize:"0.65rem",color:"#888",letterSpacing:1}},"本月總收入"),React.createElement("div",{style:{fontSize:"1.5rem",fontWeight:800,color:"#4caf8c",fontFamily:"'Noto Serif TC',serif"}},fc(totalInc))),
+          React.createElement(AddBtn,{onClick:()=>setMInc(true)},"＋ 新增收入")
+        ),
+        D.incomes.length===0&&React.createElement(Empty,{text:"尚無收入記錄"}),
+        D.incomes.map(r=>React.createElement(RRow,{key:r.id,r,color:"#4caf8c",onDel:()=>openDel("inc",r.id)}))
+      ),
+
+      // ── 支出 ──
+      tab===2&&React.createElement("div",null,
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"1rem"}},
+          React.createElement("div",null,React.createElement("div",{style:{fontSize:"0.65rem",color:"#888",letterSpacing:1}},"本月總支出"),React.createElement("div",{style:{fontSize:"1.5rem",fontWeight:800,color:"#e05a5a",fontFamily:"'Noto Serif TC',serif"}},fc(totalExp))),
+          React.createElement(AddBtn,{onClick:()=>setMExp(true)},"＋ 新增支出")
+        ),
+        D.expenses.length===0&&React.createElement(Empty,{text:"尚無支出記錄"}),
+        D.expenses.map(r=>React.createElement(RRow,{key:r.id,r,color:"#e05a5a",onDel:()=>openDel("exp",r.id)}))
+      ),
+
+      // ── 股票 ──
+      tab===3&&React.createElement("div",null,
+        React.createElement("div",{style:{display:"flex",gap:"0.5rem",marginBottom:"1rem",flexWrap:"wrap"}},
+          React.createElement(StatCard,{label:"持倉市值",value:fc(stocksMV),color:"#c9a84c",sub:"成本 "+fc(stocksCost)}),
+          React.createElement(StatCard,{label:"未實現損益",value:fc(stocksMV-stocksCost),color:stocksMV-stocksCost>=0?"#4caf8c":"#e05a5a",trend:stocksCost>0?(stocksMV-stocksCost)/stocksCost*100:undefined}),
+          React.createElement(StatCard,{label:"已實現損益(含費)",value:fc(realPnL),color:realPnL>=0?"#4caf8c":"#e05a5a",sub:"歷史累計"})
+        ),
+        React.createElement("div",{style:{display:"flex",justifyContent:"flex-end",marginBottom:"0.8rem"}},React.createElement(AddBtn,{onClick:()=>setMStk(true)},"＋ 新增交易")),
+        posArr.length>0&&React.createElement(Section,{title:"目前持倉"},
+          posArr.map(p=>{const cur=D.stockPrices[p.symbol]||p.avgCost;const pnl=(cur-p.avgCost)*p.shares;const pct=p.avgCost>0?(cur-p.avgCost)/p.avgCost*100:0;return React.createElement("div",{key:p.symbol,className:"rh",style:{padding:"0.8rem 0.4rem",borderBottom:"1px solid #1e1e30",borderRadius:8}},
+            React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0.35rem",cursor:"pointer"},onClick:()=>{setPriceTarget(p.symbol);setPriceInput(String(D.stockPrices[p.symbol]||""));setMPrice(true);}},
+              React.createElement("div",null,React.createElement("div",{style:{fontWeight:700,color:"#c9a84c"}},p.symbol),React.createElement("div",{style:{fontSize:"0.7rem",color:"#777"}},p.name),React.createElement("div",{style:{fontSize:"0.65rem",color:"#555",marginTop:1}},p.shares.toLocaleString()+" 股")),
+              React.createElement("div",{style:{textAlign:"center"}},React.createElement("div",{style:{fontSize:"0.65rem",color:"#666"}},"均價(含費)/現價"),React.createElement("div",{style:{fontSize:"0.8rem",color:"#aaa"}},p.avgCost.toFixed(2)),React.createElement("div",{style:{fontSize:"0.9rem",color:"#e8e8f0",fontWeight:700}},cur.toFixed(2))),
+              React.createElement("div",{style:{textAlign:"right"}},React.createElement("div",{style:{fontSize:"0.65rem",color:"#666"}},"未實現損益"),React.createElement("div",{style:{color:pnl>=0?"#4caf8c":"#e05a5a",fontWeight:700}},(pnl>=0?"+":"")+fc(pnl)),React.createElement("div",{style:{fontSize:"0.7rem",color:pct>=0?"#4caf8c":"#e05a5a"}},(pct>=0?"▲":"▼")+Math.abs(pct).toFixed(2)+"%"),React.createElement("div",{style:{fontSize:"0.6rem",color:"#555",marginTop:2}},"點擊更新現價"))
+            ),
+            real[p.symbol]?.totalRealized!==0&&real[p.symbol]&&React.createElement("div",{style:{marginTop:"0.45rem",paddingTop:"0.45rem",borderTop:"1px dashed #2a2a3e"}},React.createElement(PnLPill,{value:real[p.symbol].totalRealized,label:"歷史已實現(含費)"}))
+          );})),
+        Object.values(real).filter(r=>r.totalRealized!==0&&!pos[r.symbol]).length>0&&React.createElement(Section,{title:"已結清"},
+          Object.values(real).filter(r=>r.totalRealized!==0&&!pos[r.symbol]).map(r=>React.createElement("div",{key:r.symbol,className:"rh",style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"0.7rem 0.4rem",borderBottom:"1px solid #1e1e30",borderRadius:8}},React.createElement("div",null,React.createElement("div",{style:{fontWeight:700,color:"#c9a84c"}},r.symbol),React.createElement("div",{style:{fontSize:"0.7rem",color:"#777"}},r.name+" · 已全數賣出")),React.createElement(PnLPill,{value:r.totalRealized,label:"已實現"})))
+        ),
+        posArr.length===0&&Object.keys(real).length===0&&React.createElement(Empty,{text:"尚無股票記錄"}),
+        D.stocks.length>0&&React.createElement(Section,{title:"交易紀錄"},
+          D.stocks.map(tx=>{const pnl=tx.action==="賣出"?calcSellPnL(tx,D.stocks):null;const fee=cFee(tx.price,tx.shares);const tax=tx.action==="賣出"?cTax(tx.price,tx.shares):0;return React.createElement("div",{key:tx.id,className:"rh",style:{padding:"0.65rem 0.4rem",borderBottom:"1px solid #1e1e30",borderRadius:8,display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
+            React.createElement("div",{style:{display:"flex",gap:"0.5rem",alignItems:"flex-start",flex:1}},React.createElement(Bdg,{color:tx.action==="買入"?"#4caf8c":"#e05a5a"},tx.action),React.createElement("div",null,React.createElement("div",{style:{fontSize:"0.86rem",fontWeight:600}},tx.symbol+(tx.name?" "+tx.name:"")),React.createElement("div",{style:{fontSize:"0.68rem",color:"#666"}},fDt(tx.date)+" · "+tx.shares+"股 @ "+tx.price),React.createElement("div",{style:{fontSize:"0.65rem",color:"#555",marginTop:1}},"手續費 "+fc(fee)+(tx.action==="賣出"?" ＋ 交易稅 "+fc(tax):"")))),
+            React.createElement("div",{style:{textAlign:"right",flexShrink:0,display:"flex",flexDirection:"column",alignItems:"flex-end",gap:3}},React.createElement("div",{style:{color:"#aaa",fontSize:"0.86rem"}},fc(tx.shares*tx.price)),pnl!==null&&React.createElement("div",{style:{fontSize:"0.75rem",color:pnl>=0?"#4caf8c":"#e05a5a",fontWeight:700}},"損益 "+(pnl>=0?"+":"")+fc(pnl)),React.createElement("button",{onClick:()=>openDel("stk",tx.id),style:{background:"#e05a5a22",border:"1px solid #e05a5a44",borderRadius:6,padding:"2px 7px",color:"#e05a5a",cursor:"pointer",fontSize:"0.68rem",fontFamily:"inherit"}},"🗑"))
+          );})
+        )
+      ),
+
+      // ── 存款 ──
+      tab===4&&React.createElement("div",null,
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"1rem"}},
+          React.createElement("div",null,React.createElement("div",{style:{fontSize:"0.65rem",color:"#888",letterSpacing:1}},"存款總額"),React.createElement("div",{style:{fontSize:"1.5rem",fontWeight:800,color:"#4a9eff",fontFamily:"'Noto Serif TC',serif"}},fc(totalSav)),React.createElement("div",{style:{fontSize:"0.7rem",color:"#555",marginTop:2}},D.savings.length+" 個帳戶")),
+          React.createElement(AddBtn,{onClick:()=>setMSav(true),color:"#4a9eff"},"＋ 新增帳戶")
+        ),
+        D.savings.length===0&&React.createElement(Empty,{text:"尚無存款帳戶"}),
+        D.savings.map(a=>{
+          const bal=acctBal(a.id,D.savingTxs);
+          const txs=D.savingTxs.filter(t=>t.accountId===a.id).slice(0,5);
+          const pct=totalSav>0?bal/totalSav*100:0;
+          return React.createElement("div",{key:a.id,style:{background:"#12122088",border:"1px solid #4a9eff22",borderRadius:14,padding:"1rem",marginBottom:"0.75rem"}},
+            React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}},
+              React.createElement("div",null,React.createElement("div",{style:{fontWeight:700,color:"#4a9eff",fontSize:"0.95rem"}},"🏦 "+a.bank+(a.name?" · "+a.name:"")),a.note&&React.createElement("div",{style:{fontSize:"0.7rem",color:"#666",marginTop:2}},a.note)),
+              React.createElement("div",{style:{textAlign:"right"}},React.createElement("div",{style:{fontWeight:800,fontSize:"1.1rem",color:"#4a9eff"}},fc(bal)),React.createElement("div",{style:{fontSize:"0.68rem",color:"#666"}},pct.toFixed(1)+"% 占比"),
+                React.createElement("div",{style:{display:"flex",gap:4,marginTop:5,justifyContent:"flex-end"}},
+                  React.createElement(AddBtn,{onClick:()=>{setAdjAccount(a);setMSavAdj(true);},color:"#4caf8c"},"存入／提款"),
+                  React.createElement("button",{onClick:()=>openDel("sav",a.id),style:{background:"#e05a5a22",border:"1px solid #e05a5a44",borderRadius:8,padding:"0.35rem 0.6rem",color:"#e05a5a",cursor:"pointer",fontSize:"0.72rem",fontFamily:"inherit"}},"🗑")
+                )
+              )
+            ),
+            React.createElement("div",{style:{height:4,background:"#1e1e30",borderRadius:99,margin:"0.7rem 0 0.5rem"}},React.createElement("div",{style:{width:`${Math.min(pct,100)}%`,height:"100%",background:"#4a9eff",borderRadius:99}})),
+            txs.length>0&&React.createElement("div",{style:{marginTop:"0.4rem"}},
+              txs.map(t=>React.createElement("div",{key:t.id,style:{display:"flex",justifyContent:"space-between",padding:"0.3rem 0",borderBottom:"1px solid #1e1e3040",fontSize:"0.72rem"}},
+                React.createElement("span",{style:{color:"#777"}},fDt(t.date)+" ",React.createElement(Bdg,{color:t.type==="提款"?"#e05a5a":t.type==="初始餘額"?"#c9a84c":"#4caf8c"},t.type),t.note?" "+t.note:""),
+                React.createElement("div",{style:{display:"flex",alignItems:"center",gap:4}},React.createElement("span",{style:{color:t.type==="提款"?"#e05a5a":"#4caf8c",fontWeight:700}},(t.type==="提款"?"－":"＋")+fc(t.amount)),React.createElement("button",{onClick:()=>openDel("savTx",t.id),style:{background:"none",border:"none",color:"#e05a5a66",cursor:"pointer",fontSize:"0.68rem"}},"✕"))
+              ))
+            )
+          );
+        })
+      ),
+
+      // ── 證券庫存 ──
+      tab===5&&React.createElement("div",null,
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"1rem"}},
+          React.createElement("div",null,React.createElement("div",{style:{fontSize:"0.65rem",color:"#888",letterSpacing:1}},"證券庫存市值"),React.createElement("div",{style:{fontSize:"1.5rem",fontWeight:800,color:"#9b59b6",fontFamily:"'Noto Serif TC',serif"}},fc(secMV)),React.createElement("div",{style:{fontSize:"0.72rem",color:secMV-D.securities.reduce((s,a)=>s+a.cost*a.shares,0)>=0?"#4caf8c":"#e05a5a",marginTop:2}},"損益 "+(secMV-D.securities.reduce((s,a)=>s+a.cost*a.shares,0)>=0?"+":"")+fc(secMV-D.securities.reduce((s,a)=>s+a.cost*a.shares,0)))),
+          React.createElement(AddBtn,{onClick:()=>{setSecF({symbol:"",name:"",shares:"",cost:"",marketValue:""});setMSecEdit(null);setMSec(true);},color:"#9b59b6"},"＋ 新增庫存")
+        ),
+        D.securities.length===0&&React.createElement(Empty,{text:"尚無證券庫存"}),
+        D.securities.map(s=>{const pnl=s.marketValue-s.cost*s.shares;const pp=s.cost*s.shares>0?pnl/(s.cost*s.shares)*100:0;return React.createElement("div",{key:s.id,className:"rh",style:{padding:"0.8rem 0.4rem",borderBottom:"1px solid #1e1e30",borderRadius:8}},
+          React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0.35rem"}},
+            React.createElement("div",null,React.createElement("div",{style:{fontWeight:700,color:"#9b59b6"}},s.symbol),React.createElement("div",{style:{fontSize:"0.7rem",color:"#777"}},s.name||"-"),React.createElement("div",{style:{fontSize:"0.65rem",color:"#555",marginTop:1}},(+s.shares).toLocaleString()+" 股")),
+            React.createElement("div",{style:{textAlign:"center"}},React.createElement("div",{style:{fontSize:"0.65rem",color:"#666"}},"成本/股 / 市值"),React.createElement("div",{style:{fontSize:"0.8rem",color:"#aaa"}},(+s.cost).toFixed(2)),React.createElement("div",{style:{fontSize:"0.9rem",fontWeight:700}},fc(s.marketValue))),
+            React.createElement("div",{style:{textAlign:"right"}},React.createElement("div",{style:{fontSize:"0.65rem",color:"#666"}},"損益"),React.createElement("div",{style:{color:pnl>=0?"#4caf8c":"#e05a5a",fontWeight:700}},(pnl>=0?"+":"")+fc(pnl)),React.createElement("div",{style:{fontSize:"0.7rem",color:pp>=0?"#4caf8c":"#e05a5a"}},(pp>=0?"▲":"▼")+Math.abs(pp).toFixed(2)+"%"),
+              React.createElement("div",{style:{display:"flex",gap:3,justifyContent:"flex-end",marginTop:4}},
+                React.createElement("button",{onClick:()=>{setSecF({symbol:s.symbol,name:s.name||"",shares:String(s.shares),cost:String(s.cost),marketValue:String(s.marketValue)});setMSecEdit(s.id);setMSec(true);},style:{background:"#9b59b622",border:"1px solid #9b59b644",borderRadius:6,padding:"2px 6px",color:"#9b59b6",cursor:"pointer",fontSize:"0.68rem",fontFamily:"inherit"}},"✏"),
+                React.createElement("button",{onClick:()=>openDel("sec",s.id),style:{background:"#e05a5a22",border:"1px solid #e05a5a44",borderRadius:6,padding:"2px 6px",color:"#e05a5a",cursor:"pointer",fontSize:"0.68rem",fontFamily:"inherit"}},"🗑")
+              )
+            )
+          )
+        );})
+      ),
+
+      // ── 加密幣 ──
+      tab===6&&React.createElement("div",null,
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"0.8rem"}},
+          React.createElement("div",null,React.createElement("div",{style:{fontSize:"0.65rem",color:"#888",letterSpacing:1}},"加密幣總市值（TWD）"),React.createElement("div",{style:{fontSize:"1.45rem",fontWeight:800,color:"#f39c12",fontFamily:"'Noto Serif TC',serif"}},fc(cryptoTWD)),React.createElement("div",{style:{fontSize:"0.72rem",color:cryptoTWD-cryptoCost>=0?"#4caf8c":"#e05a5a",marginTop:2}},"損益 "+(cryptoTWD-cryptoCost>=0?"+":"")+fc(cryptoTWD-cryptoCost))),
+          React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:"0.35rem",alignItems:"flex-end"}},
+            React.createElement(AddBtn,{onClick:()=>{setCryF({symbol:"BTC",name:"Bitcoin",cgId:"bitcoin",isToken:false,tokenSymbol:"TSLA",quantity:"",costTWD:"",manualPrice:""});setMCryEdit(null);setMCry(true);},color:"#f39c12"},"＋ 新增"),
+            React.createElement("button",{onClick:refreshCryptoPx,disabled:cryptoLoading,style:{background:"transparent",border:"1px solid #f39c1266",borderRadius:8,padding:"0.3rem 0.65rem",color:"#f39c12",fontSize:"0.72rem",cursor:"pointer",fontFamily:"inherit"}},cryptoLoading?"更新中…":"🔄 更新幣價")
+          )
+        ),
+        React.createElement("div",{style:{background:"#f39c1211",border:"1px solid #f39c1233",borderRadius:10,padding:"0.55rem 0.85rem",marginBottom:"0.85rem",fontSize:"0.72rem",color:"#f39c12"}},"匯率：1 USD = "+D.usdTwd+" TWD　",
+          React.createElement("button",{onClick:()=>{const r=prompt("請輸入最新匯率（1 USD = ? TWD）",D.usdTwd);if(r&&+r>0)setD(p=>({...p,usdTwd:+r}));},style:{background:"none",border:"1px solid #f39c1255",borderRadius:6,padding:"1px 8px",color:"#f39c12",cursor:"pointer",fontSize:"0.7rem",fontFamily:"inherit",marginLeft:6}},"調整")
+        ),
+        D.crypto.length===0&&React.createElement(Empty,{text:"尚無加密幣記錄"}),
+        D.crypto.map(c=>{const px=D.cryptoPrices[c.cgId||c.symbol]?.usd||c.manualPrice||0;const mv=c.quantity*px*D.usdTwd;const pnl=mv-c.costTWD*c.quantity;const pp=c.costTWD>0?pnl/(c.costTWD*c.quantity)*100:0;return React.createElement("div",{key:c.id,className:"rh",style:{padding:"0.8rem 0.4rem",borderBottom:"1px solid #1e1e30",borderRadius:8}},
+          React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0.35rem"}},
+            React.createElement("div",null,React.createElement("div",{style:{fontWeight:700,color:"#f39c12"}},c.symbol),React.createElement("div",{style:{fontSize:"0.7rem",color:"#777"}},c.name),React.createElement("div",{style:{fontSize:"0.65rem",color:"#555",marginTop:1}},"持有 "+c.quantity)),
+            React.createElement("div",{style:{textAlign:"center"}},React.createElement("div",{style:{fontSize:"0.65rem",color:"#666"}},(c.isToken?"手動價格":"幣價 USD")+" / TWD"),React.createElement("div",{style:{fontSize:"0.8rem",color:"#aaa"}},"$"+px.toFixed(2)),React.createElement("div",{style:{fontSize:"0.88rem",fontWeight:700}},fc(mv))),
+            React.createElement("div",{style:{textAlign:"right"}},React.createElement("div",{style:{fontSize:"0.65rem",color:"#666"}},"損益"),React.createElement("div",{style:{color:pnl>=0?"#4caf8c":"#e05a5a",fontWeight:700}},(pnl>=0?"+":"")+fc(pnl)),React.createElement("div",{style:{fontSize:"0.7rem",color:pp>=0?"#4caf8c":"#e05a5a"}},(pp>=0?"▲":"▼")+Math.abs(pp).toFixed(2)+"%"),
+              React.createElement("div",{style:{display:"flex",gap:3,justifyContent:"flex-end",marginTop:4}},
+                React.createElement("button",{onClick:()=>{setCryF({symbol:c.symbol,name:c.name,cgId:c.cgId,isToken:!!c.isToken,tokenSymbol:c.symbol,quantity:String(c.quantity),costTWD:String(c.costTWD),manualPrice:String(c.manualPrice||"")});setMCryEdit(c.id);setMCry(true);},style:{background:"#f39c1222",border:"1px solid #f39c1244",borderRadius:6,padding:"2px 6px",color:"#f39c12",cursor:"pointer",fontSize:"0.68rem",fontFamily:"inherit"}},"✏"),
+                React.createElement("button",{onClick:()=>openDel("cry",c.id),style:{background:"#e05a5a22",border:"1px solid #e05a5a44",borderRadius:6,padding:"2px 6px",color:"#e05a5a",cursor:"pointer",fontSize:"0.68rem",fontFamily:"inherit"}},"🗑")
+              )
+            )
+          )
+        );})
+      ),
+
+      // ── 設定 ──
+      tab===7&&React.createElement("div",null,
+        React.createElement("div",{style:{fontFamily:"'Noto Serif TC',serif",fontSize:"1.1rem",color:"#c9a84c",marginBottom:"1rem",fontWeight:700}},"☁️ 多裝置同步設定"),
+        React.createElement("div",{style:{background:"#12122099",border:"1px solid #2a2a3e",borderRadius:14,padding:"1.1rem",marginBottom:"1rem"}},
+          React.createElement("div",{style:{fontSize:"0.8rem",fontWeight:700,color:"#e8e8f0",marginBottom:"0.5rem"}},"目前狀態："+syncLabel),
+          sync==="ok"&&React.createElement("div",{style:{fontSize:"0.75rem",color:"#4caf8c"}},"✅ 已連線，手機電腦資料即時同步"),
+          sync==="err"&&React.createElement("div",{style:{fontSize:"0.75rem",color:"#e05a5a"}},"❌ 連線失敗，請確認設定是否正確"),
+          sync==="local"&&React.createElement("div",{style:{fontSize:"0.75rem",color:"#888"}},"資料僅存在此裝置，尚未設定同步")
+        ),
+        React.createElement("div",{style:{background:"#c9a84c0e",border:"1px solid #c9a84c33",borderRadius:12,padding:"0.9rem",marginBottom:"1rem",fontSize:"0.75rem",color:"#aaa",lineHeight:1.8}},
+          React.createElement("div",{style:{color:"#c9a84c",fontWeight:700,marginBottom:"0.4rem"}},"📋 設定步驟"),
+          React.createElement("div",null,"① 前往 firebase.google.com 建立專案"),
+          React.createElement("div",null,"② 建立 Firestore 資料庫（測試模式）"),
+          React.createElement("div",null,"③ 專案設定 → 您的應用程式 → 新增網頁應用"),
+          React.createElement("div",null,"④ 複製 firebaseConfig 貼到下方"),
+          React.createElement("div",null,"⑤ 設定同步代碼（所有裝置要相同）")
+        ),
+        React.createElement(Fld,{label:"Firebase Config（貼上 JSON）"},
+          React.createElement("textarea",{value:fbCfgStr,onChange:e=>setFbCfgStr(e.target.value),placeholder:'{\n  "apiKey": "...",\n  "authDomain": "...",\n  "projectId": "...",\n  "storageBucket": "...",\n  "messagingSenderId": "...",\n  "appId": "..."\n}',style:{...iS,height:160,resize:"vertical",fontFamily:"monospace",fontSize:"0.8rem"}})
+        ),
+        React.createElement(Fld,{label:"同步代碼（自訂，所有裝置要一樣）"},React.createElement(Inp,{type:"text",placeholder:"例：myfinance2024",value:vCode,onChange:e=>setVCode(e.target.value.trim())})),
+        React.createElement(SaveBtn,{onClick:saveFBSettings,color:"#4a9eff",disabled:!fbCfgStr||!vCode},"🔗 連線並同步"),
+        sync!=="local"&&React.createElement("button",{onClick:disconnectFB,style:{display:"block",width:"100%",marginTop:"0.5rem",padding:"0.7rem",background:"transparent",border:"1px solid #e05a5a44",borderRadius:12,color:"#e05a5a",cursor:"pointer",fontFamily:"inherit",fontSize:"0.88rem"}},"斷開連線"),
+        React.createElement("div",{style:{marginTop:"1.5rem",borderTop:"1px solid #2a2a3e",paddingTop:"1rem"}},
+          React.createElement("div",{style:{fontSize:"0.8rem",fontWeight:700,color:"#e8e8f0",marginBottom:"0.7rem"}},"🌐 換算匯率"),
+          React.createElement("div",{style:{display:"flex",gap:"0.6rem",alignItems:"center"}},
+            React.createElement("div",{style:{fontSize:"0.85rem",color:"#aaa"}},"1 USD＝"),
+            React.createElement("input",{style:{...iS,flex:1,maxWidth:120},type:"number",value:D.usdTwd,onChange:e=>setD(p=>({...p,usdTwd:+e.target.value}))}),
+            React.createElement("div",{style:{fontSize:"0.85rem",color:"#aaa"}},"TWD")
+          )
+        )
+      )
+    ),
+
+    // ── Modals ──
+    React.createElement(Modal,{open:mExp,onClose:()=>setMExp(false),title:"新增支出"},
+      React.createElement(DtFld,{value:eF.date,onChange:v=>setEF(f=>({...f,date:v}))}),
+      React.createElement(Fld,{label:"類別"},React.createElement(Sel,{value:eF.category,onChange:v=>setEF(f=>({...f,category:v})),options:EXP_CATS})),
+      React.createElement(Fld,{label:"金額（元）"},React.createElement(Inp,{type:"number",placeholder:"0",value:eF.amount,onChange:e=>setEF(f=>({...f,amount:e.target.value}))})),
+      React.createElement(Fld,{label:"備註（選填）"},React.createElement(Inp,{type:"text",placeholder:"選填",value:eF.note,onChange:e=>setEF(f=>({...f,note:e.target.value}))})),
+      React.createElement(SaveBtn,{onClick:addExp,color:"#e05a5a"},"儲存支出")
+    ),
+    React.createElement(Modal,{open:mInc,onClose:()=>setMInc(false),title:"新增收入"},
+      React.createElement(DtFld,{value:iF.date,onChange:v=>setIF(f=>({...f,date:v}))}),
+      React.createElement(Fld,{label:"類別"},React.createElement(Sel,{value:iF.category,onChange:v=>setIF(f=>({...f,category:v})),options:INC_CATS})),
+      React.createElement(Fld,{label:"金額（元）"},React.createElement(Inp,{type:"number",placeholder:"0",value:iF.amount,onChange:e=>setIF(f=>({...f,amount:e.target.value}))})),
+      React.createElement(Fld,{label:"備註（選填）"},React.createElement(Inp,{type:"text",placeholder:"選填",value:iF.note,onChange:e=>setIF(f=>({...f,note:e.target.value}))})),
+      React.createElement(SaveBtn,{onClick:addInc,color:"#4caf8c"},"儲存收入")
+    ),
+    React.createElement(Modal,{open:mStk,onClose:()=>setMStk(false),title:"新增股票交易"},
+      React.createElement(DtFld,{value:sF.date,onChange:v=>setSF(f=>({...f,date:v}))}),
+      React.createElement(Fld,{label:"動作"},React.createElement(Sel,{value:sF.action,onChange:v=>setSF(f=>({...f,action:v})),options:["買入","賣出"]})),
+      React.createElement(SymInput,{symbol:sF.symbol,onSymbol:v=>setSF(f=>({...f,symbol:v,name:""})),onName:v=>setSF(f=>({...f,name:v}))}),
+      React.createElement(Fld,{label:"股票名稱"},React.createElement(Inp,{type:"text",placeholder:"自動帶入或手動",value:sF.name,onChange:e=>setSF(f=>({...f,name:e.target.value}))})),
+      React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0.6rem"}},
+        React.createElement(Fld,{label:"股數"},React.createElement(Inp,{type:"number",placeholder:"1000",value:sF.shares,onChange:e=>setSF(f=>({...f,shares:e.target.value}))})),
+        React.createElement(Fld,{label:sF.action==="買入"?"買入價格（元）":"賣出價格（元）"},React.createElement(Inp,{type:"number",placeholder:"100.00",value:sF.price,onChange:e=>setSF(f=>({...f,price:e.target.value}))}))
+      ),
+      React.createElement(FeeBox,{action:sF.action,price:sF.price,shares:sF.shares,avgCost:sF.action==="賣出"&&pos[sF.symbol]?pos[sF.symbol].avgCost:0}),
+      React.createElement(Fld,{label:"備註（選填）"},React.createElement(Inp,{type:"text",placeholder:"選填",value:sF.note,onChange:e=>setSF(f=>({...f,note:e.target.value}))})),
+      React.createElement(SaveBtn,{onClick:addStk,color:"#c9a84c"},"儲存交易")
+    ),
+    React.createElement(Modal,{open:mPrice,onClose:()=>setMPrice(false),title:"更新 "+priceTarget+" 現價"},
+      priceTarget&&pos[priceTarget]&&React.createElement("div",{style:{fontSize:"0.75rem",color:"#888",marginBottom:"0.7rem"}},"目前均價（含費）："+pos[priceTarget].avgCost.toFixed(2)+" 元"),
+      React.createElement(Fld,{label:"目前市價（元）"},React.createElement(Inp,{type:"number",placeholder:"0.00",value:priceInput,onChange:e=>setPriceInput(e.target.value)})),
+      React.createElement(SaveBtn,{onClick:updateStockPrice},"更新價格")
+    ),
+    React.createElement(Modal,{open:mSav,onClose:()=>setMSav(false),title:"新增存款帳戶"},
+      React.createElement(Fld,{label:"銀行"},React.createElement(Sel,{value:savF.bank,onChange:v=>setSavF(f=>({...f,bank:v})),options:BANKS})),
+      React.createElement(Fld,{label:"帳戶名稱（選填）"},React.createElement(Inp,{type:"text",placeholder:"薪資帳戶、零用錢…",value:savF.name,onChange:e=>setSavF(f=>({...f,name:e.target.value}))})),
+      React.createElement(Fld,{label:"目前餘額（元）"},React.createElement(Inp,{type:"number",placeholder:"0",value:savF.initBalance,onChange:e=>setSavF(f=>({...f,initBalance:e.target.value}))})),
+      React.createElement(Fld,{label:"備註（選填）"},React.createElement(Inp,{type:"text",placeholder:"選填",value:savF.note,onChange:e=>setSavF(f=>({...f,note:e.target.value}))})),
+      React.createElement(SaveBtn,{onClick:addSav,color:"#4a9eff"},"建立帳戶")
+    ),
+    React.createElement(SavTxModal,{open:mSavAdj,onClose:()=>setMSavAdj(false),account:adjAccount,onSave:addSavTx}),
+    React.createElement(Modal,{open:mSec,onClose:()=>setMSec(false),title:mSecEdit?"編輯證券庫存":"新增證券庫存"},
+      React.createElement(SymInput,{symbol:secF.symbol,onSymbol:v=>setSecF(f=>({...f,symbol:v,name:""})),onName:v=>setSecF(f=>({...f,name:v}))}),
+      React.createElement(Fld,{label:"股票名稱"},React.createElement(Inp,{type:"text",placeholder:"自動帶入或手動",value:secF.name,onChange:e=>setSecF(f=>({...f,name:e.target.value}))})),
+      React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0.6rem"}},
+        React.createElement(Fld,{label:"持有股數"},React.createElement(Inp,{type:"number",placeholder:"1000",value:secF.shares,onChange:e=>setSecF(f=>({...f,shares:e.target.value}))})),
+        React.createElement(Fld,{label:"成本價/股（元）"},React.createElement(Inp,{type:"number",placeholder:"100.00",value:secF.cost,onChange:e=>setSecF(f=>({...f,cost:e.target.value}))}))
+      ),
+      React.createElement(Fld,{label:"目前市值（元）"},
+        React.createElement(Inp,{type:"number",placeholder:"整體市值",value:secF.marketValue,onChange:e=>setSecF(f=>({...f,marketValue:e.target.value}))}),
+        secF.cost&&secF.shares&&secF.marketValue&&React.createElement("div",{style:{fontSize:"0.73rem",marginTop:"0.3rem",color:(+secF.marketValue-+secF.cost*+secF.shares)>=0?"#4caf8c":"#e05a5a",fontWeight:700}},"損益："+(+secF.marketValue-+secF.cost*+secF.shares>=0?"+":"")+fc(+secF.marketValue-+secF.cost*+secF.shares))
+      ),
+      React.createElement(SaveBtn,{onClick:addSec,color:"#9b59b6"},"儲存庫存")
+    ),
+    React.createElement(Modal,{open:mCry,onClose:()=>setMCry(false),title:mCryEdit?"編輯加密幣":"新增加密幣／代幣化美股"},
+      React.createElement("div",{style:{display:"flex",gap:"0.5rem",marginBottom:"0.85rem"}},
+        [{l:"加密貨幣",v:false},{l:"代幣化美股",v:true}].map(o=>React.createElement("button",{key:String(o.v),onClick:()=>setCryF(f=>({...f,isToken:o.v})),style:{flex:1,padding:"0.55rem",background:cryF.isToken===o.v?"#f39c1222":"#0f0f22",border:`1.5px solid ${cryF.isToken===o.v?"#f39c12":"#2e2e44"}`,borderRadius:10,color:cryF.isToken===o.v?"#f39c12":"#888",cursor:"pointer",fontWeight:700,fontFamily:"inherit",fontSize:"0.85rem"}},o.l))
+      ),
+      !cryF.isToken?React.createElement(Fld,{label:"幣種"},React.createElement(Sel,{value:cryF.symbol,onChange:v=>{const c=CRYPTO_LIST.find(x=>x.symbol===v)||{symbol:v,name:v,cgId:null};setCryF(f=>({...f,symbol:c.symbol,name:c.name,cgId:c.cgId}));},options:CRYPTO_LIST.map(c=>({v:c.symbol,l:c.symbol+" - "+c.name}))})):
+      React.createElement(Fld,{label:"代幣化股票"},React.createElement(Sel,{value:cryF.tokenSymbol,onChange:v=>setCryF(f=>({...f,tokenSymbol:v})),options:TOKEN_STOCKS})),
+      React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0.6rem"}},
+        React.createElement(Fld,{label:"持有數量"},React.createElement(Inp,{type:"number",placeholder:"0.5",value:cryF.quantity,onChange:e=>setCryF(f=>({...f,quantity:e.target.value}))})),
+        React.createElement(Fld,{label:"成本均價（TWD/單位）"},React.createElement(Inp,{type:"number",placeholder:"0",value:cryF.costTWD,onChange:e=>setCryF(f=>({...f,costTWD:e.target.value}))}))
+      ),
+      (cryF.isToken||cryF.cgId===null)&&React.createElement(Fld,{label:"手動輸入現價（USD）"},React.createElement(Inp,{type:"number",placeholder:"0.00",value:cryF.manualPrice,onChange:e=>setCryF(f=>({...f,manualPrice:e.target.value}))})),
+      !cryF.isToken&&cryF.cgId&&React.createElement("div",{style:{fontSize:"0.7rem",color:"#888",marginBottom:"0.7rem"}},"💡 點「🔄 更新幣價」可自動從 CoinGecko 抓取最新幣價"),
+      React.createElement(SaveBtn,{onClick:addCry,color:"#f39c12"},"儲存")
+    ),
+    React.createElement(DelConfirm,{open:!!del,onCancel:()=>setDel(null),onConfirm:confirmDel})
+  );
+}
+
+const root=ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
